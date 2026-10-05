@@ -8,9 +8,13 @@ import type { Foreman } from '../../foreman.js';
 import type { Goal, Task } from '../../protocol.js';
 
 function roster(fm: Foreman): string {
-  return fm
-    .agents()
-    .map((a) => `- ${a.name} (${a.id}) - ${a.role}${a.title ? `, ${a.title}` : ''}`)
+  // Only agents actually on shift. Listing an off-shift worker invites the lead to assign work to
+  // someone the scheduler will never dispatch, and the task then sits on the wall untouched.
+  const on = fm.agents().filter((a) => a.active);
+  const line = (a: (typeof on)[number]) =>
+    `- ${a.name} (${a.id}) - ${a.role}${a.title ? `, ${a.title}` : ''}`;
+  return [...on.filter((a) => a.role === 'lead'), ...on.filter((a) => a.role === 'worker')]
+    .map(line)
     .join('\n');
 }
 
@@ -77,13 +81,19 @@ export function workerSystemPrompt(fm: Foreman): string {
   ].join('\n');
 }
 
-export function workPrompt(task: Task): string {
+export function workPrompt(task: Task, worktree?: string): string {
   return [
     `Task ${task.id}: ${task.title}`,
     task.description ? `\nDetails:\n${task.description}` : '',
     task.deps.length ? `\nDepends on (already done): ${task.deps.join(', ')}` : '',
+    worktree
+      ? `\nYou are in your own git worktree:\n  ${worktree}\nEvery change you make must be inside it. Other agents work in their own worktrees; do not touch anything outside this one.`
+      : '',
     '',
-    'Implement it in your worktree, run the tests, then summarise what you changed.',
+    'Implement exactly this task, run the tests, and commit your work.',
+    'When you are done, call update_task with status "review" and a summary of what you changed',
+    'and how you verified it. If you cannot finish, call update_task with status "blocked" and say',
+    'what is stopping you, rather than guessing.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -98,8 +108,13 @@ export function reviewPrompt(task: Task, diff: string): string {
     diff.slice(0, 20_000),
     '```',
     '',
-    'Approve only if the change does what the task asked, is safe, and has passing tests.',
-    'Otherwise say exactly what must change.',
+    'Check that it does what the task asked, is safe, and does not break anything else.',
+    '',
+    'If it is good: call request_merge with task_id and a 2-4 line summary for the human (what',
+    'changed, how it was tested, any risk). You do not wait for them to merge.',
+    '',
+    'If it needs work: call update_task with status "doing" and a summary saying exactly what must',
+    'change. The worker will pick it up again.',
   ].join('\n');
 }
 

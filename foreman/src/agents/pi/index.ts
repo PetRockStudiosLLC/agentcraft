@@ -21,8 +21,9 @@ import { FOREMAN_VERSION, type PiConfig } from '../../config.js';
 import type { Decision, Goal, Task } from '../../protocol.js';
 import { toolActivity } from '../activity.js';
 import { runAgentTool, type ToolHooks, type ToolOutcome } from '../../agenttools.js';
+import { renderDiffText } from '../../diff.js';
 import { PiRpc, type UiRequest } from './rpc.js';
-import { leadSystemPrompt, planPrompt } from './prompts.js';
+import { leadSystemPrompt, planPrompt, reviewPrompt, workPrompt } from './prompts.js';
 
 export type JobKind = 'plan' | 'work' | 'review' | 'followup';
 
@@ -58,6 +59,8 @@ interface PendingDialog {
 interface AgentProc {
   rpc: PiRpc;
   sessionKey: string;
+  /** directory the process was spawned in. A worker's differs per task (its own worktree). */
+  cwd: string;
   inflight?: Job;
   /** off shift until resume/spawn */
   stopped: boolean;
@@ -99,6 +102,22 @@ export class PiBackend implements Backend {
 
   async start(): Promise<void> {
     this.fm.setStatus({ message: `pi backend (${this.cfg.provider ?? 'default model'})` });
+
+    // Bring the configured team on shift. The roster creates workers as 'off shift'
+    // (active: false) and only the lead starts active, so a backend that never activates them
+    // leaves the scheduler with an EMPTY TEAM: the lead plans, tasks land on the wall, and
+    // nothing ever runs. Nothing errors - the goal is active, the task is ready, and no worker
+    // moves - which is the worst way for this to fail.
+    const onShift: string[] = [];
+    for (const id of this.cfg.workers) {
+      const a = this.fm.agent(id);
+      if (!a || a.role !== 'worker' || this.state.stopped.includes(id)) continue;
+      this.fm.setAgent(id, { active: true });
+      this.fm.act(id, 'idle', 'lounge', 'on shift');
+      onShift.push(id);
+    }
+    this.fm.log.info(`pi: team on shift [${onShift.join(', ')}]`);
+
     // Reconcile: any goal that was mid-flight when the Foreman stopped is resumed by the lead.
     const goal = this.fm.currentGoal();
     if (goal && goal.status === 'planning') {
@@ -119,13 +138,17 @@ export class PiBackend implements Backend {
   async submitGoal(goal: Goal): Promise<void> {
     const lead = this.leadAgent();
     if (!lead) throw new ClientError('pi backend: no lead agent in the cast');
-    await this.runJob(lead.id, {
-      kind: 'plan',
-      agentId: lead.id,
-      prompt: planPrompt(goal),
-      sessionKey: `goal:${goal.id}`,
-      goalId: goal.id,
-    });
+    await this.runJob(
+      lead.id,
+      {
+        kind: 'plan',
+        agentId: lead.id,
+        prompt: planPrompt(goal),
+        sessionKey: `goal:${goal.id}`,
+        goalId: goal.id,
+      },
+      this.cfg.repoPath ?? process.cwd(),
+    );
   }
 
   // ---- user / foreman callbacks -------------------------------------------------------------
@@ -157,7 +180,10 @@ export class PiBackend implements Backend {
     return {
       onReview: () => undefined,
       onChangesRequested: () => undefined,
-      onTasksChanged: () => undefined,
+      // The lead creating a task is what starts the studio. Without this the wall never moves.
+      onTasksChanged: () => {
+        void this.schedule().catch((e) => this.fm.log.error(`pi schedule: ${(e as Error).message}`));
+      },
       onMergeRequested: () => undefined,
       onWaiting: () => undefined,
     };
@@ -172,12 +198,11 @@ export class PiBackend implements Backend {
     const p = this.procs.get(id);
     if (!p || !p.rpc.alive) {
       // Not running: start a fresh turn carrying the message.
-      void this.runJob(id, {
-        kind: 'followup',
-        agentId: id,
-        prompt: text,
-        sessionKey: this.sessionKeyFor(id),
-      }).catch((e) => this.fm.log.error(`pi followup: ${(e as Error).message}`));
+      void this.runJob(
+        id,
+        { kind: 'followup', agentId: id, prompt: text, sessionKey: this.sessionKeyFor(id) },
+        this.cwdFor(id),
+      ).catch((e) => this.fm.log.error(`pi followup: ${(e as Error).message}`));
       return;
     }
     // Mid-turn: steer (delivered after the current tool batch, before the next model call).
@@ -254,15 +279,21 @@ export class PiBackend implements Backend {
     return this.state.sessions[agentId] ?? `agent:${agentId}`;
   }
 
-  private async ensureProc(agentId: string): Promise<AgentProc> {
+  private async ensureProc(agentId: string, cwd: string): Promise<AgentProc> {
     const existing = this.procs.get(agentId);
-    if (existing?.rpc.alive) return existing;
+    if (existing?.rpc.alive && existing.cwd === cwd) return existing;
+    if (existing) {
+      // The directory changed (a worker moved to another task's worktree). cwd is fixed at spawn,
+      // so the old process is useless: continuing a session from the wrong directory edits the
+      // wrong checkout, and nothing surfaces that until the diff is reviewed.
+      await this.killProc(agentId);
+    }
 
     const a = this.fm.requireAgent(agentId);
     const rpc = new PiRpc({
       bin: this.cfg.piBin,
       args: [...this.cfg.piArgs, ...PI_MINIMAL_ARGS, '--session-dir', this.sessionDir(agentId)],
-      cwd: this.cfg.repoPath ?? process.cwd(),
+      cwd,
       // The extension reads these to reach the foreman and to know who it is. They are set per
       // process, so one agent cannot act as another the way a shared config file would allow.
       env: {
@@ -279,6 +310,7 @@ export class PiBackend implements Backend {
     const proc: AgentProc = {
       rpc,
       sessionKey: this.sessionKeyFor(agentId),
+      cwd,
       stopped: false,
       dialogs: new Map(),
       running: false,
@@ -324,21 +356,200 @@ export class PiBackend implements Backend {
 
   // ---- jobs --------------------------------------------------------------------------------
 
-  private async runJob(agentId: string, job: Job): Promise<void> {
+  private async runJob(agentId: string, job: Job, cwd: string): Promise<void> {
     const a = this.fm.requireAgent(agentId);
-    const proc = await this.ensureProc(agentId);
+    const proc = await this.ensureProc(agentId, cwd);
     this.fm.act(agentId, 'thinking', 'desk', `${a.name} is thinking`);
     this.fm.agentLog(agentId, 'text', `[${job.kind}] ${firstLine(job.prompt)}`);
     proc.inflight = job;
     proc.running = true;
     try {
+      // Resolves when pi ACCEPTS the prompt, not when the turn ends. The job therefore stays
+      // inflight until agent_end: clearing it here would make a working agent look idle and throw
+      // away the task id needed to close the job out.
       await proc.rpc.prompt(`${leadSystemPrompt(this.fm)}\n\n${job.prompt}`);
     } catch (e) {
-      this.fm.agentLog(agentId, 'error', `pi prompt failed: ${(e as Error).message}`);
-      this.fm.act(agentId, 'error', 'desk', 'prompt failed');
-    } finally {
       proc.running = false;
       if (proc.inflight === job) delete proc.inflight;
+      this.fm.agentLog(agentId, 'error', `pi prompt failed: ${(e as Error).message}`);
+      this.fm.act(agentId, 'error', 'desk', 'prompt failed');
+    }
+  }
+
+  // ---- scheduling ----------------------------------------------------------------------------
+
+  /** Where an agent should run: its task's worktree when it has one, else the repo root. */
+  private cwdFor(agentId: string): string {
+    const a = this.fm.agent(agentId);
+    if (a?.repoId && a.worktree) {
+      const wt = this.fm.repos.findWorktree(a.repoId, a.worktree);
+      if (wt?.status === 'active') return wt.path;
+    }
+    return this.cfg.repoPath ?? process.cwd();
+  }
+
+  /** Workers that can take work: active, not stopped off shift. */
+  private team(): string[] {
+    return this.fm
+      .agents()
+      .filter((a) => a.role === 'worker' && a.active && !this.state.stopped.includes(a.id))
+      .map((a) => a.id);
+  }
+
+  private isFree(agentId: string): boolean {
+    if (this.procs.get(agentId)?.running) return false;
+    return !this.fm.tasks.list().some((t) => t.assignee === agentId && (t.status === 'doing' || t.status === 'review'));
+  }
+
+  private workersRunning(): number {
+    return [...this.procs.values()].filter((p) => p.running).length;
+  }
+
+  /**
+   * Hand ready tasks to free workers. This is what makes the wall live: without it the tasks the
+   * lead writes are inert text, and the studio is one agent talking to itself.
+   */
+  private async schedule(): Promise<void> {
+    if (this.closing) return;
+    const active = this.fm.goals().filter((g) => g.status === 'active');
+    const ready = active.flatMap((g) => this.fm.tasks.ready(g.id));
+    this.fm.log.info(
+      `pi: schedule - ${active.length} active goal(s), ${ready.length} ready task(s), ${this.workersRunning()} running, team [${this.team().join(', ')}]`,
+    );
+
+    // Reviews first. A finished task with no merge decision waiting is the lead's next job, and
+    // skipping it stops the loop at "in review": the work is committed, and nothing ever asks the
+    // user to merge it. One at a time, because the lead is a single agent.
+    const lead = this.leadAgent();
+    if (lead?.active && !this.procs.get(lead.id)?.running) {
+      const next = this.fm.tasks
+        .list()
+        .find(
+          (t) =>
+            t.status === 'review' &&
+            t.worktree &&
+            !this.fm.decisions.open().some((d) => d.kind === 'merge' && d.taskId === t.id),
+        );
+      if (next) {
+        await this.reviewTask(lead.id, next.id);
+        return;
+      }
+    }
+
+    for (const goal of active) {
+      for (const t of this.fm.tasks.ready(goal.id)) {
+        if (this.workersRunning() >= this.cfg.maxConcurrent) return;
+        // Honour an existing assignee, otherwise take any free worker.
+        const preferred = t.assignee && this.team().includes(t.assignee) ? t.assignee : undefined;
+        const w = preferred ?? this.team().find((x) => this.isFree(x));
+        if (!w || !this.isFree(w)) continue;
+        try {
+          await this.startWork(w, t, goal);
+        } catch (e) {
+          // The task stays on the board; a later schedule() will try again.
+          this.fm.log.error(`pi: could not start ${t.id} for ${w}: ${(e as Error).message}`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Hand a finished task to the lead for review, with its real diff. Without this the loop stops
+   * at "in review": the work is committed, the tests pass, and nothing ever reaches the user.
+   */
+  private async reviewTask(leadId: string, taskId: string): Promise<void> {
+    const t = this.fm.tasks.get(taskId);
+    if (!t || t.status !== 'review' || !t.repoId || !t.worktree) return;
+    try {
+      await this.fm.repos.refresh(t.repoId);
+      const diff = await this.fm.repos.diff(t.repoId, t.worktree);
+      this.fm.act(leadId, 'reading', 'mergestation', `reviewing ${t.id}`);
+      this.fm.bus.feed('task', `${this.fm.nameOf(leadId)} is reviewing ${t.id}`, { agentId: leadId });
+      await this.runJob(
+        leadId,
+        {
+          kind: 'review',
+          agentId: leadId,
+          prompt: reviewPrompt(t, renderDiffText(diff.files)),
+          sessionKey: `review:${t.id}`,
+          taskId: t.id,
+          ...(t.goalId ? { goalId: t.goalId } : {}),
+        },
+        this.cwdFor(leadId),
+      );
+    } catch (e) {
+      this.fm.agentLog(leadId, 'error', `could not review ${t.id}: ${(e as Error).message}`);
+    }
+  }
+
+  private async startWork(agentId: string, t: Task, goal: Goal): Promise<void> {
+    const repoId = t.repoId ?? goal.repoId;
+    if (!repoId) throw new Error(`task ${t.id} has no repo`);
+    if (!t.repoId) this.fm.tasks.update(t.id, { repoId });
+    this.fm.tasks.update(t.id, { assignee: agentId });
+    // A worktree per task, always. The worker's whole process is pointed at it, so it cannot
+    // touch another agent's checkout or the user's.
+    const wt = await this.fm.repos.createWorktree(repoId, agentId, t);
+    this.fm.tasks.update(t.id, { branch: wt.branch, worktree: wt.id });
+    this.fm.tasks.setStatus(t.id, 'doing');
+    this.fm.setAgent(agentId, { taskId: t.id, repoId, worktree: wt.id, active: true });
+    this.fm.act(agentId, 'thinking', 'desk', `starting ${t.id}`);
+    this.fm.bus.feed('task', `${this.fm.nameOf(agentId)} started ${t.id}: ${t.title}`, { agentId });
+    await this.runJob(
+      agentId,
+      { kind: 'work', agentId, prompt: workPrompt(t, wt.path), sessionKey: `task:${t.id}`, taskId: t.id, goalId: goal.id },
+      wt.path,
+    );
+  }
+
+  /**
+   * A worker's turn ended. Commit whatever it left behind and move the task to review.
+   *
+   * The commit is done here rather than left to the agent: an agent that says it is finished but
+   * never committed leaves a worktree that cannot be merged, so the task would look done while
+   * being worthless. A dirty worktree is a normal outcome, not an error.
+   */
+  private async finishWork(agentId: string, taskId: string): Promise<void> {
+    const t = this.fm.tasks.get(taskId);
+    if (!t || t.status !== 'doing' || !t.repoId || !t.worktree) return;
+    try {
+      await this.fm.repos.refresh(t.repoId);
+      const wt = this.fm.repos.findWorktree(t.repoId, t.worktree);
+      if (wt && wt.status === 'active' && (wt.files > 0 || wt.ahead > 0)) {
+        await this.fm.repos.commitAll(t.repoId, t.worktree, `agentcraft: ${t.id} ${t.title}`);
+      }
+      this.fm.tasks.setStatus(t.id, 'review', { force: true });
+      this.fm.bus.feed('task', `${this.fm.nameOf(agentId)} finished ${t.id}: in review`, { agentId });
+      this.fm.setAgent(agentId, { taskId: null, worktree: null });
+      this.fm.act(agentId, 'idle', 'lounge', `${t.id} in review`);
+      // The lead reviews next; a finished worker frees a slot for the next ready task.
+      await this.schedule();
+    } catch (e) {
+      const msg = (e as Error).message;
+      this.fm.agentLog(agentId, 'error', `could not finish ${t.id}: ${msg}`);
+      this.fm.tasks.setStatus(t.id, 'blocked', { reason: msg });
+      this.fm.act(agentId, 'blocked', 'desk', 'blocked');
+    }
+  }
+
+  /** A turn ended: the plan made the goal live, or a worker's task needs closing out. */
+  private async onJobEnd(agentId: string, job: Job): Promise<void> {
+    this.fm.log.info(`pi: ${job.kind} turn ended for ${this.fm.nameOf(agentId)}`);
+    if (job.kind === 'plan' && job.goalId) {
+      this.fm.setGoal(job.goalId, { status: 'active' });
+      this.fm.agentLog(agentId, 'text', 'plan complete; handing work out');
+      this.fm.log.info(`pi: goal ${job.goalId} is active; scheduling work`);
+      await this.schedule();
+      return;
+    }
+    if (job.kind === 'work' && job.taskId) {
+      await this.finishWork(agentId, job.taskId);
+      return;
+    }
+    if (job.kind === 'review') {
+      // The lead either requested a merge (a decision is now waiting on the user) or sent the task
+      // back for changes. Either way, look for the next thing to advance.
+      await this.schedule();
     }
   }
 
@@ -356,7 +567,14 @@ export class PiBackend implements Backend {
       case 'agent_settled':
         // Turn over: emit the trailing partial line rather than swallowing it.
         this.flushText(agentId);
-        if (proc) proc.running = false;
+        if (proc) {
+          const job = proc.inflight;
+          proc.running = false;
+          if (proc.inflight === job) delete proc.inflight;
+          if (job) {
+            void this.onJobEnd(agentId, job).catch((e) => this.fm.log.error(`pi job end: ${(e as Error).message}`));
+          }
+        }
         return;
       case 'turn_start':
         this.fm.act(agentId, 'thinking', 'desk', 'thinking');
