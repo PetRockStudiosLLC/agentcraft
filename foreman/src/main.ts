@@ -1,8 +1,10 @@
-// Foreman entry point: `npm run start -- --backend sim|claude [--repo <path>] [--speed N] ...`
+// Foreman entry point: `npm run start -- --backend sim|claude|pi [--repo <path>] [--speed N] ...`
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ClaudeBackend } from './agents/claude/index.js';
+import { PiBackend } from './agents/pi/index.js';
 import { SimBackend } from './agents/sim/index.js';
 import { DEFAULT_SIM_GOAL } from './agents/sim/scenario.js';
 import { FOREMAN_VERSION, HELP, loadConfig, type Config } from './config.js';
@@ -60,12 +62,39 @@ export async function main(argv: string[]): Promise<void> {
     cfg.repos.push(demo);
   }
 
+  // pi agents edit a real repository. Without one they would run in the foreman's own directory.
+  if (cfg.backend === 'pi' && cfg.repos.length === 0) {
+    log.warn('pi: no --repo given, agents will run in the foreman directory itself');
+  }
+
+  // Local tool channel. A fresh secret per run, handed to agent processes so a pi extension can
+  // reach `fm`; without it any local process could drive the agents.
+  cfg.pi.channelToken = randomBytes(24).toString('hex');
+
   const foreman = new Foreman({ config: cfg, logger: log });
-  const backend = cfg.backend === 'sim' ? new SimBackend(foreman, cfg.sim) : new ClaudeBackend(foreman, cfg.claude);
-  const server = new ForemanServer(foreman, { host: cfg.host, port: cfg.port, allowBrowserOrigins: cfg.allowBrowserOrigins, validateOutbound: cfg.debug, log });
+  const backend =
+    cfg.backend === 'sim'
+      ? new SimBackend(foreman, cfg.sim)
+      : cfg.backend === 'pi'
+        ? new PiBackend(foreman, cfg.pi)
+        : new ClaudeBackend(foreman, cfg.claude);
+  const server = new ForemanServer(foreman, {
+    host: cfg.host,
+    port: cfg.port,
+    allowBrowserOrigins: cfg.allowBrowserOrigins,
+    validateOutbound: cfg.debug,
+    toolToken: cfg.pi.channelToken,
+    // Only the pi backend has tools living outside this process. sim/claude run theirs in-process,
+    // so the route stays unimplemented (501) for them.
+    ...(backend instanceof PiBackend ? { runTool: backend.runTool.bind(backend) } : {}),
+    log,
+  });
 
   try {
     await server.start();
+    // Agents are spawned lazily, on the first goal, so the bound port is known before any of
+    // them needs it.
+    cfg.pi.channelPort = server.port;
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code;
     if (code === 'EADDRINUSE') {
@@ -107,8 +136,14 @@ export async function main(argv: string[]): Promise<void> {
   process.on('unhandledRejection', (e) => log.error(`unhandled rejection: ${(e as Error)?.stack ?? e}`));
 
   await foreman.start(backend);
-  if (backend instanceof SimBackend && (cfg.autostart || cfg.goal)) {
-    await backend.autostart(cfg.goal ?? DEFAULT_SIM_GOAL);
+  if (cfg.autostart || !!cfg.goal) {
+    if (backend instanceof SimBackend) {
+      await backend.autostart(cfg.goal ?? DEFAULT_SIM_GOAL);
+    } else if (cfg.goal) {
+      // claude/pi have no canned goal, so --goal has to go through the normal submit path.
+      // Without this branch --goal is silently ignored for every backend except sim.
+      await foreman.submitGoal(cfg.goal);
+    }
   } else if (cfg.goal) {
     await foreman.submitGoal(cfg.goal).catch((e) => log.error(`goal: ${(e as Error).message}`));
   }

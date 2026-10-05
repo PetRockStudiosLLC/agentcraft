@@ -11,6 +11,12 @@ export const FOREMAN_VERSION = '0.1.0';
 
 /** Repo root of the AgentCraft project (foreman/src/config.ts -> ../..). */
 export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+/**
+ * The foreman package itself (`foreman/`), one level up from `src/`. Things that ship WITH the
+ * foreman - the pi extension - live here. PROJECT_ROOT is the repo root instead, and is for the
+ * shared `sandbox/` fixtures.
+ */
+export const FOREMAN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export interface ClaudeConfig {
   leadModel: string;
@@ -52,6 +58,29 @@ export interface SimConfig {
   ambient: boolean;
 }
 
+export interface PiConfig {
+  /**
+   * Executable that runs pi. Defaults to `process.execPath` so spawn hands over an absolute
+   * path and never has to resolve a bare name through PATH.
+   */
+  piBin: string;
+  /** argv before the mode flags: the pi CLI entry, plus --provider/--model when configured. */
+  piArgs: string[];
+  provider?: string;
+  model?: string;
+  /** cwd for every agent process: the target repo the team works in. */
+  repoPath?: string;
+  /**
+   * The foreman's local tool channel. The port is known only after the server binds, so main.ts
+   * fills these in before any agent is spawned; an agent without them cannot act on the studio.
+   */
+  channelPort?: number;
+  channelToken?: string;
+  home: string;
+  workers: string[];
+  maxConcurrent: number;
+}
+
 export interface Config {
   backend: BackendName;
   /** the person the team works for (prompts, feed, UI); default: the OS user name */
@@ -81,6 +110,7 @@ export interface Config {
   signMerges: boolean;
   claude: ClaudeConfig;
   sim: SimConfig;
+  pi: PiConfig;
 }
 
 type Flags = Record<string, string | boolean>;
@@ -175,10 +205,12 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
   const file = readJson<Record<string, unknown>>(path.join(home, 'config.json')) ?? {};
   const fileClaude = (file.claude ?? {}) as Record<string, unknown>;
   const fileSim = (file.sim ?? {}) as Record<string, unknown>;
+  const filePi = (file.pi ?? {}) as Record<string, unknown>;
   const pick = (k: string, envKey?: string): unknown => flags[k] ?? (envKey ? env[envKey] : undefined) ?? file[k];
 
   const backendRaw = String(pick('backend', 'AGENTCRAFT_BACKEND') ?? 'claude');
-  if (backendRaw !== 'sim' && backendRaw !== 'claude') throw new Error(`unknown backend "${backendRaw}" (use sim or claude)`);
+  if (backendRaw !== 'sim' && backendRaw !== 'claude' && backendRaw !== 'pi')
+    throw new Error(`unknown backend "${backendRaw}" (use sim, claude or pi)`);
   const backend = backendRaw as BackendName;
   const profile = str(pick('profile', 'AGENTCRAFT_PROFILE')) ?? backend;
   if (!/^[a-zA-Z0-9_-]+$/.test(profile)) throw new Error(`bad profile name "${profile}"`);
@@ -198,6 +230,25 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
       : ['juniper', 'kit', 'wren'];
 
   const model = str(flags.model);
+
+  // pi is a peer install, not a dependency of the foreman, so its CLI path is resolved rather
+  // than imported. Configured via env or ~/.agentcraft/config.json (no dedicated flags, so the
+  // flag allowlist stays as it is).
+  const piCli =
+    str(env.AGENTCRAFT_PI_CLI ?? filePi.cli) ??
+    path.join(os.homedir(), 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js');
+  const piProvider = str(env.AGENTCRAFT_PI_PROVIDER ?? filePi.provider);
+  const piModel = str(env.AGENTCRAFT_PI_MODEL ?? filePi.model) ?? model;
+  // The agentcraft tool set. Passed explicitly because the backend runs with extension
+  // discovery OFF (--no-extensions), so a studio-wide pi config cannot leak into an agent.
+  const piArgs = [
+    piCli,
+    ...(piProvider ? ['--provider', piProvider] : []),
+    ...(piModel ? ['--model', piModel] : []),
+    '-e',
+    path.join(FOREMAN_ROOT, 'extensions', 'agentcraft-pi', 'index.ts'),
+  ];
+
   const cfg: Config = {
     backend,
     userName: (str(pick('user-name', 'AGENTCRAFT_USER_NAME')) ?? str(file.userName))?.trim().slice(0, 40) || defaultUserName(),
@@ -235,6 +286,16 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
       leadReview: bool(flags['lead-review'] ?? fileClaude.leadReview, true),
       useClaudeLogin: bool(flags['use-claude-login'] ?? env.AGENTCRAFT_USE_CLAUDE_LOGIN ?? fileClaude.useClaudeLogin, false),
     },
+    pi: {
+      piBin: str(env.AGENTCRAFT_PI_BIN) ?? process.execPath,
+      piArgs,
+      provider: piProvider,
+      model: piModel,
+      repoPath: repos[0],
+      home,
+      workers,
+      maxConcurrent: Math.max(1, num(flags['max-concurrent'] ?? filePi.maxConcurrent, 2)),
+    },
     sim: {
       speed: Math.max(0.05, num(flags.speed ?? env.AGENTCRAFT_SIM_SPEED ?? fileSim.speed, 1)),
       seed: num(flags.seed ?? fileSim.seed, 7),
@@ -252,7 +313,7 @@ export const HELP = `AgentCraft Foreman ${FOREMAN_VERSION}
 
 usage: npm run start -- [options]
 
-  --backend sim|claude     agent backend (default: claude)
+  --backend sim|claude|pi  agent backend (default: claude)
   --repo <path>[,<path>]   register local git repo(s) at start (sim: defaults to a fresh sandbox/sim-demo)
   --goal "<text>"          submit a goal right away
   --port <n>               WebSocket port (default 7878, env AGENTCRAFT_PORT)

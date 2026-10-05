@@ -14,6 +14,7 @@ import { Notifier } from './notifier.js';
 import type {
   Agent,
   AgentState,
+  BackendName,
   ClientMessage,
   Decision,
   ForemanStatus,
@@ -32,7 +33,7 @@ import { setUserName, userName } from './user.js';
 import { truncate } from './util/text.js';
 
 export interface Backend {
-  readonly name: 'sim' | 'claude';
+  readonly name: BackendName;
   /** Called once after the core is ready (and after restart: resume work). */
   start(): Promise<void>;
   stop(): Promise<void>;
