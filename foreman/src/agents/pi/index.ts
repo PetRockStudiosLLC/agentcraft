@@ -548,7 +548,19 @@ export class PiBackend implements Backend {
     }
     if (job.kind === 'review') {
       // The lead either requested a merge (a decision is now waiting on the user) or sent the task
-      // back for changes. Either way, look for the next thing to advance.
+      // back. A task sent back is 'doing' again, and `tasks.ready()` only returns work that has not
+      // started - so without this branch the worker is never re-dispatched and the task stalls
+      // silently, holding a worktree nobody will touch.
+      const t = job.taskId ? this.fm.tasks.get(job.taskId) : undefined;
+      const goal = t?.goalId ? this.fm.goal(t.goalId) : this.fm.currentGoal();
+      if (t && t.status === 'doing' && t.assignee && goal) {
+        this.fm.log.info(`pi: ${t.id} sent back to ${t.assignee}; re-dispatching`);
+        this.fm.bus.feed('task', `${this.fm.nameOf(job.agentId)} sent ${t.id} back for changes`, {
+          agentId: job.agentId,
+        });
+        await this.startWork(t.assignee, t, goal);
+        return;
+      }
       await this.schedule();
     }
   }
