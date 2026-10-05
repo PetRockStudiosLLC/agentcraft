@@ -24,6 +24,9 @@ import net.minecraft.client.Minecraft;
  * AGENTCRAFT_PORT     Foreman port (default 7878), always 127.0.0.1
  * AGENTCRAFT_FOREMAN  0 disables the link (the HUD then says so)
  * </pre>
+ *
+ * <p>If the link cannot connect, {@link ForemanAutostart} starts the Foreman itself. See that
+ * class for AGENTCRAFT_AUTOSTART, AGENTCRAFT_REPO, AGENTCRAFT_NODE and AGENTCRAFT_BACKEND.
  */
 public final class ForemanFeature {
 	private ForemanFeature() {
@@ -40,7 +43,12 @@ public final class ForemanFeature {
 		// Executor: the client thread. Minecraft.getInstance() is resolved lazily (it does not exist yet during init).
 		ForemanLink link = new ForemanLink(uri, modVersion, state, r -> Minecraft.getInstance().execute(r), enabled);
 		Foreman.install(state, link);
-		ClientLifecycleEvents.CLIENT_STARTED.register(mc -> link.start());
+		ClientLifecycleEvents.CLIENT_STARTED.register(mc -> {
+			link.start();
+			// Start the Foreman too when nobody else has: opening the game first should not leave an
+			// empty studio with no explanation for why nothing is happening.
+			ForemanAutostart.init(link, port);
+		});
 		ClientLifecycleEvents.CLIENT_STOPPING.register(mc -> link.stop());
 
 		DevBridge.addStateContributor((mc, o) -> o.add("foreman", stateJson()));

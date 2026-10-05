@@ -18,12 +18,14 @@
   tools\launch.ps1 -Repo C:\code\life-tracker          # register a repo with the Foreman
   tools\launch.ps1 -UseClaudeLogin                     # personal use: your `claude` CLI login instead of an API key
   tools\launch.ps1 -Backend sim                        # scripted demo team, no API calls
+  tools\launch.ps1 -Backend pi -Repo C:\code\thing     # pi agents on your own provider/model
+  tools\launch.ps1 -Backend pi -ForemanArgs '--model','deepseek-v4.1-flash'
   tools\launch.ps1 -Showcase late                      # static showcase state (sim)
   tools\launch.ps1 -Dev -Showcase busy -Home C:\Projects\agentcraft\.agentcraft-home -Port 27878 -DevPort 7889
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [ValidateSet('sim', 'claude')][string]$Backend,
+    [ValidateSet('sim', 'claude', 'pi')][string]$Backend,
     [string[]]$Repo,
     [Alias('Profile')][string]$ForemanProfile,
     # -Showcase [busy|late]: a switch with an optional positional value
@@ -214,7 +216,10 @@ if ($live) {
     if ($Autostart) { $fargs += '--autostart' }
     if ($Goal) { $fargs += @('--goal', $Goal) }
     if ($Dev -or $NoNotify) { $fargs += '--no-notify' } elseif ($Notify) { $fargs += '--notify' }
-    if ($UseClaudeLogin) { $fargs += '--use-claude-login' }
+    if ($UseClaudeLogin) {
+        if ($Backend -ne 'claude') { Fail "-UseClaudeLogin only applies to the claude backend (got '$Backend')." }
+        $fargs += '--use-claude-login'
+    }
     if ($ForemanArgs) { $fargs += $ForemanArgs }
     if ($DryRun) {
         Write-Kv 'would run' ("node " + (Join-CmdArgs $fargs) + "   (in foreman/)") 'Yellow'

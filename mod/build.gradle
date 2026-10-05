@@ -58,10 +58,17 @@ dependencies {
 
 processResources {
 	def version = project.version
+	// The checkout this jar was built from, so the mod can start the Foreman itself. rootDir is
+	// mod/, so its parent is the agentcraft checkout (which contains foreman/).
+	def repoPath = rootDir.parentFile.absolutePath.replace('\\', '/')
 	inputs.property "version", version
+	inputs.property "repoPath", repoPath
 
 	filesMatching("fabric.mod.json") {
 		expand "version": version
+	}
+	filesMatching("agentcraft-repo.properties") {
+		expand "repoPath": repoPath
 	}
 }
 
