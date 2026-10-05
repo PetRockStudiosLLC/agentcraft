@@ -118,8 +118,15 @@ export class PiBackend implements Backend {
     }
     this.fm.log.info(`pi: team on shift [${onShift.join(', ')}]`);
 
-    // Reconcile: any goal that was mid-flight when the Foreman stopped is resumed by the lead.
+    // Reconcile: a goal that was mid-flight when the Foreman stopped is resumed by the lead -
+    // but only with a repo, or the agents plan and then work inside the foreman's own checkout.
     const goal = this.fm.currentGoal();
+    if (!this.cfg.repoPath) {
+      if (goal) {
+        this.fm.log.warn(`pi: goal ${goal.id} is waiting, but no repo is connected - add one with /repo add <path>`);
+      }
+      return;
+    }
     if (goal && goal.status === 'planning') {
       this.fm.log.info(`pi: resuming planning for goal ${goal.id}`);
       await this.submitGoal(goal);
@@ -138,6 +145,12 @@ export class PiBackend implements Backend {
   async submitGoal(goal: Goal): Promise<void> {
     const lead = this.leadAgent();
     if (!lead) throw new ClientError('pi backend: no lead agent in the cast');
+    // Refuse rather than fall back to process.cwd(). The foreman's own checkout is not a
+    // workspace: a worker given it creates a worktree of the tooling and edits that, which is a
+    // startling thing for opening the game to do.
+    if (!this.cfg.repoPath) {
+      throw new ClientError('pi backend: no repo connected - add one with /repo add <path>');
+    }
     await this.runJob(
       lead.id,
       {
