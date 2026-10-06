@@ -263,8 +263,30 @@ export class PiBackend implements Backend {
   }
 
   onTaskAction(task: Task, action: 'reassign' | 'cancel' | 'retry' | 'prioritize', arg?: string): void {
-    // v1: task lifecycle is driven by the target repo's own graph; nothing to do on the wire yet.
-    this.fm.log.info(`pi: task action ${action} on ${task.id}${arg ? ` (${arg})` : ''}`);
+    // The foreman has already applied the change to the task graph (status, assignee, priority).
+    // A backend only has to stop whatever is still running on it and let the scheduler see the
+    // new state - otherwise a cancelled or reassigned worker keeps editing a worktree nobody is
+    // going to look at.
+    if (action === 'cancel' || action === 'reassign') {
+      const worker = task.assignee;
+      const proc = worker ? this.procs.get(worker) : undefined;
+      // A worker runs one task at a time (isFree() guarantees it), so a running process belonging
+      // to this task's assignee is running THIS task. Testing proc.inflight instead misses the
+      // window between the task going 'doing' and runJob registering the job - creating a worktree
+      // and spawning a process takes seconds, which is exactly when a cancel tends to arrive, and
+      // the cancel would then be silently ignored while the worker carried on and merged.
+      if (worker && proc?.running) {
+        this.fm.agentLog(worker, 'text', `${task.id} was ${action}led; stopping this turn`);
+        void proc.rpc.abort().catch(() => undefined);
+      }
+    }
+    if (action === 'retry') this.fm.log.info(`pi: ${task.id} queued again`);
+    if (action === 'reassign') {
+      this.fm.log.info(`pi: ${task.id} reassigned to ${this.fm.nameOf(task.assignee ?? '?')}`);
+    }
+    // cancel leaves the task 'cancelled' and reassign/retry leave it 'todo', so finishWork will
+    // correctly decline to close it out when the aborted turn ends.
+    void this.schedule().catch((e) => this.fm.log.error(`pi schedule: ${(e as Error).message}`));
   }
 
   async onAgentAction(
@@ -390,6 +412,22 @@ export class PiBackend implements Backend {
     const proc = await this.ensureProc(agentId, cwd);
     this.fm.act(agentId, 'thinking', 'desk', `${a.name} is thinking`);
     this.fm.agentLog(agentId, 'text', `[${job.kind}] ${firstLine(job.prompt)}`);
+
+    // Creating a worktree and spawning a process takes seconds, and the event loop keeps running
+    // while it does - so a cancel or reassign can land before we get here. Prompting anyway starts
+    // a turn for work nobody wants, and because the abort already went out (to a process with
+    // nothing running) the cancel looks like it was simply ignored while the worker finishes and
+    // merges. Check the task is still live before starting anything.
+    if (job.taskId) {
+      const t = this.fm.tasks.get(job.taskId);
+      if (!t || (t.status !== 'doing' && t.status !== 'review')) {
+        this.fm.log.info(`pi: ${job.taskId} is ${t?.status ?? 'gone'}; not starting the turn`);
+        proc.running = false;
+        if (proc.inflight === job) delete proc.inflight;
+        return;
+      }
+    }
+
     proc.inflight = job;
     proc.running = true;
     try {
@@ -397,6 +435,18 @@ export class PiBackend implements Backend {
       // inflight until agent_end: clearing it here would make a working agent look idle and throw
       // away the task id needed to close the job out.
       await proc.rpc.prompt(`${leadSystemPrompt(this.fm)}\n\n${job.prompt}`);
+
+      // The prompt and a cancel can cross on the wire. If the abort is processed while pi has
+      // nothing running it is a no-op, and the turn then starts - so the cancel looks ignored and
+      // the worker finishes and merges work that was cancelled. Re-check now that the turn has
+      // been accepted and abort it for real.
+      if (job.taskId) {
+        const t = this.fm.tasks.get(job.taskId);
+        if (!t || (t.status !== 'doing' && t.status !== 'review')) {
+          this.fm.log.info(`pi: ${job.taskId} is ${t?.status ?? 'gone'} as its turn started; aborting`);
+          await proc.rpc.abort().catch(() => undefined);
+        }
+      }
     } catch (e) {
       proc.running = false;
       if (proc.inflight === job) delete proc.inflight;
@@ -516,9 +566,27 @@ export class PiBackend implements Backend {
     if (!repoId) throw new Error(`task ${t.id} has no repo`);
     if (!t.repoId) this.fm.tasks.update(t.id, { repoId });
     this.fm.tasks.update(t.id, { assignee: agentId });
+
+    // A task handed to a different worker continues from that worker's branch. Without this the
+    // new worktree is created from the base branch and the earlier commits are simply stranded:
+    // the task looks re-done from scratch and the first worker's work disappears.
+    let startPoint: string | undefined;
+    if (t.worktree) {
+      await this.fm.repos.refresh(repoId).catch(() => undefined);
+      const prev = this.fm.repos.findWorktree(repoId, t.worktree);
+      if (prev && prev.agentId !== agentId && prev.status === 'active' && prev.ahead > 0) {
+        startPoint = prev.branch;
+        this.fm.bus.feed(
+          'task',
+          `${this.fm.nameOf(agentId)} continues ${t.id} from ${this.fm.nameOf(prev.agentId)}'s branch`,
+          { agentId },
+        );
+      }
+    }
+
     // A worktree per task, always. The worker's whole process is pointed at it, so it cannot
     // touch another agent's checkout or the user's.
-    const wt = await this.fm.repos.createWorktree(repoId, agentId, t);
+    const wt = await this.fm.repos.createWorktree(repoId, agentId, t, startPoint ? { startPoint } : {});
     this.fm.tasks.update(t.id, { branch: wt.branch, worktree: wt.id });
     this.fm.tasks.setStatus(t.id, 'doing');
     this.fm.setAgent(agentId, { taskId: t.id, repoId, worktree: wt.id, active: true });
@@ -569,6 +637,10 @@ export class PiBackend implements Backend {
       this.fm.bus.feed('task', `${this.fm.nameOf(agentId)} finished ${t.id}: tests pass, in review`, { agentId });
       this.fm.setAgent(agentId, { taskId: null, worktree: null });
       this.fm.act(agentId, 'idle', 'lounge', `${t.id} in review`);
+      // Stop the worker's process now that its task is over. Its cwd is the worktree, which keeps
+      // that directory locked (EPERM on cleanup, warned about every poll), and the next task needs
+      // a different cwd anyway - so keeping it alive buys nothing and costs a locked directory.
+      await this.killProc(agentId);
       // The lead reviews next; a finished worker frees a slot for the next ready task.
       await this.schedule();
     } catch (e) {
@@ -598,6 +670,7 @@ export class PiBackend implements Backend {
       this.fm.tasks.setStatus(t.id, 'blocked', { force: true, reason: `CI failed ${attempts}x: ${detail}` });
       this.fm.act(agentId, 'blocked', 'desk', `${t.id} blocked on failing tests`);
       this.fm.log.warn(`pi: ${t.id} still failing after ${CI_FIX_ATTEMPTS} fix attempt(s); blocked`);
+      await this.killProc(agentId);
       await this.schedule();
       return;
     }
