@@ -98,6 +98,9 @@ public final class ConnectionBanner implements HudElement {
 		return switch (fs.backend()) {
 			case SIM -> fs.speed() != null && fs.speed() != 1.0 ? "sim ×" + trim(fs.speed()) : "sim";
 			case CLAUDE -> "claude";
+			// Named rather than left to the default. An unrecognised backend degrades to "unknown",
+			// which reads like a fault rather than like a backend the mod has not been taught yet.
+			case PI -> "pi";
 			default -> fs.backend().wire();
 		};
 	}

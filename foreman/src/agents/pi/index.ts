@@ -15,6 +15,7 @@
 // and llama-cpp at startup and will not answer a command until that finishes. Six agents each
 // paying that cost is both slow and wrong - these agents belong to the target repo, not the
 // studio. Explicit `-e` paths still load, which is how the agentcraft extension gets in.
+import fs from 'node:fs';
 import path from 'node:path';
 import { ClientError, type Backend, type Foreman } from '../../foreman.js';
 import { FOREMAN_VERSION, type PiConfig } from '../../config.js';
@@ -101,7 +102,16 @@ export class PiBackend implements Backend {
   // ---- lifecycle ---------------------------------------------------------------------------
 
   async start(): Promise<void> {
-    this.fm.setStatus({ message: `pi backend (${this.cfg.provider ?? 'default model'})` });
+    // The connection banner reads `auth`. Left at the default it stays 'unknown' forever, which
+    // is indistinguishable from "not checked yet". There is no login to verify for pi, but the
+    // CLI has to exist, and that is the one failure worth showing loudly.
+    const cli = this.cfg.piArgs[0];
+    if (!cli || !fs.existsSync(cli)) {
+      this.fm.setStatus({ auth: 'failed', message: `pi CLI not found at ${cli ?? '(unset)'}` });
+      this.fm.log.error(`pi: CLI not found at ${cli ?? '(unset)'} - set AGENTCRAFT_PI_CLI to its path`);
+      return;
+    }
+    this.fm.setStatus({ auth: 'ok', message: `pi (${this.cfg.model ?? 'default model'})` });
 
     // Bring the configured team on shift. The roster creates workers as 'off shift'
     // (active: false) and only the lead starts active, so a backend that never activates them
