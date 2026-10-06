@@ -71,6 +71,11 @@ export interface PiConfig {
   /** cwd for every agent process: the target repo the team works in. */
   repoPath?: string;
   /**
+   * Test command the foreman runs itself before a task may reach review. Omitted = detect it
+   * (package.json `test`, etc.). "The agent said it tested" is not evidence; this is.
+   */
+  ciCommand?: string;
+  /**
    * The foreman's local tool channel. The port is known only after the server binds, so main.ts
    * fills these in before any agent is spawned; an agent without them cannot act on the studio.
    */
@@ -292,6 +297,7 @@ export function loadConfig(argv: string[], env: NodeJS.ProcessEnv = process.env)
       provider: piProvider,
       model: piModel,
       repoPath: repos[0],
+      ciCommand: str(flags.ci) ?? str(filePi.ciCommand),
       home,
       workers,
       maxConcurrent: Math.max(1, num(flags['max-concurrent'] ?? filePi.maxConcurrent, 2)),

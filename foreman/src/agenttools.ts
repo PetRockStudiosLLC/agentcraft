@@ -276,6 +276,25 @@ export async function runAgentTool(
       if (!t) return fail(`no task ${taskId}`);
       if (t.status !== 'review') return fail(`${t.id} is ${t.status}, not in review`);
       if (!t.worktree || !t.repoId) return fail(`${t.id} has no worktree to merge`);
+      // The merge is the one place that actually puts code on the base branch, so this is where
+      // the test gate has to bite. Checking only the status makes CI advisory: a task whose tests
+      // failed can be moved back to review and merged, and the failure is then in the base branch.
+      if (t.ci === 'fail') {
+        return fail(
+          `${t.id} has failing tests (ci: fail). Fix them before asking to merge - ${userName()} cannot merge it either.`,
+        );
+      }
+      if (t.ci !== 'pass') {
+        // Never merge on trust. If CI has not run for this task (moved to review by hand, or the
+        // foreman restarted mid-flight) run it now rather than assume it passed.
+        fm.repos.setCi(t.repoId, 'running');
+        const ci = await fm.repos.runTests(t.repoId, t.worktree);
+        fm.repos.setCi(t.repoId, ci.pass ? 'pass' : 'fail');
+        fm.tasks.update(t.id, { ci: ci.pass ? 'pass' : 'fail' });
+        if (!ci.pass) {
+          return fail(`${t.id} failed its tests (${ci.command}):\n${ci.output}`);
+        }
+      }
       const open = fm.decisions.open().find((d) => d.kind === 'merge' && d.taskId === t.id);
       if (open) return withInbox(`Merge decision ${open.id} for ${t.id} is already waiting for ${userName()}.`);
       if (await closeIfNoChanges(fm, t.id)) {

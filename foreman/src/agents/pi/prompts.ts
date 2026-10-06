@@ -120,3 +120,29 @@ export function reviewPrompt(task: Task, diff: string): string {
 
 export const RESUME_PROMPT =
   'You were interrupted. Re-read the state of the repository and continue where you left off.';
+
+/**
+ * Sent to a worker whose work failed the foreman's own test run. Includes the real output: a
+ * worker told only "tests failed" has to guess, and usually re-runs the same command.
+ */
+export function ciFixPrompt(task: Task, command: string, output: string, summary?: string): string {
+  return [
+    `Your work on ${task.id} (${task.title}) failed its tests.`,
+    '',
+    `Command: ${command}`,
+    summary ? `Summary: ${summary}` : '',
+    '',
+    'Output (tail):',
+    '```',
+    output.slice(0, 6_000),
+    '```',
+    '',
+    'Fix the failures in your worktree, run the tests until they pass, then call update_task with',
+    `task_id "${task.id}", status "review", and a summary of what was wrong.`,
+    '',
+    'If the failure is not caused by your change, say so and call update_task with status',
+    '"blocked" and what is actually broken.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}

@@ -20,11 +20,15 @@ import path from 'node:path';
 import { ClientError, type Backend, type Foreman } from '../../foreman.js';
 import { FOREMAN_VERSION, type PiConfig } from '../../config.js';
 import type { Decision, Goal, Task } from '../../protocol.js';
+import type { TestResult } from '../../repos.js';
 import { toolActivity } from '../activity.js';
 import { runAgentTool, type ToolHooks, type ToolOutcome } from '../../agenttools.js';
 import { renderDiffText } from '../../diff.js';
 import { PiRpc, type UiRequest } from './rpc.js';
-import { leadSystemPrompt, planPrompt, reviewPrompt, workPrompt } from './prompts.js';
+import { ciFixPrompt, leadSystemPrompt, planPrompt, reviewPrompt, workPrompt } from './prompts.js';
+
+/** How many times a failing task is handed back to its worker before it is blocked instead. */
+const CI_FIX_ATTEMPTS = 2;
 
 export type JobKind = 'plan' | 'work' | 'review' | 'followup';
 
@@ -74,6 +78,8 @@ interface PiState {
   /** `agentId` -> session key currently bound, so a restart resumes the same conversation */
   sessions: Record<string, string>;
   stopped: string[];
+  /** `taskId` -> times CI has handed it back, so a hopeless task cannot loop forever */
+  ciFixes: Record<string, number>;
 }
 
 export class PiBackend implements Backend {
@@ -92,7 +98,7 @@ export class PiBackend implements Backend {
     const b = this.fm.store.data.backend;
     let st = b.pi as PiState | undefined;
     if (!st) {
-      st = { sessions: {}, stopped: [] };
+      st = { sessions: {}, stopped: [], ciFixes: {} };
       b.pi = st;
       this.fm.store.markDirty();
     }
@@ -534,15 +540,33 @@ export class PiBackend implements Backend {
    */
   private async finishWork(agentId: string, taskId: string): Promise<void> {
     const t = this.fm.tasks.get(taskId);
-    if (!t || t.status !== 'doing' || !t.repoId || !t.worktree) return;
+    // 'review' as well as 'doing': a worker that follows its instructions moves the task itself,
+    // and returning early on that would skip CI in the one case where it matters most.
+    if (!t || (t.status !== 'doing' && t.status !== 'review') || !t.repoId || !t.worktree) return;
     try {
       await this.fm.repos.refresh(t.repoId);
       const wt = this.fm.repos.findWorktree(t.repoId, t.worktree);
       if (wt && wt.status === 'active' && (wt.files > 0 || wt.ahead > 0)) {
         await this.fm.repos.commitAll(t.repoId, t.worktree, `agentcraft: ${t.id} ${t.title}`);
       }
+
+      // ---- CI ---------------------------------------------------------------------------------
+      // The worker is asked to run the tests, but "the agent said it tested" is not evidence.
+      // Run them here, in its worktree, and do not let a failing task reach review.
+      this.fm.repos.setCi(t.repoId, 'running');
+      this.fm.tasks.update(t.id, { ci: 'running' });
+      const ci = await this.fm.repos.runTests(t.repoId, t.worktree, this.cfg.ciCommand);
+      this.fm.repos.setCi(t.repoId, ci.pass ? 'pass' : 'fail');
+      this.fm.tasks.update(t.id, { ci: ci.pass ? 'pass' : 'fail' });
+      this.fm.agentLog(agentId, 'tool', `CI: ${ci.command}${ci.summary ? ` - ${ci.summary}` : ''}`);
+
+      if (!ci.pass) {
+        await this.ciFailed(agentId, t, ci);
+        return;
+      }
+
       this.fm.tasks.setStatus(t.id, 'review', { force: true });
-      this.fm.bus.feed('task', `${this.fm.nameOf(agentId)} finished ${t.id}: in review`, { agentId });
+      this.fm.bus.feed('task', `${this.fm.nameOf(agentId)} finished ${t.id}: tests pass, in review`, { agentId });
       this.fm.setAgent(agentId, { taskId: null, worktree: null });
       this.fm.act(agentId, 'idle', 'lounge', `${t.id} in review`);
       // The lead reviews next; a finished worker frees a slot for the next ready task.
@@ -553,6 +577,47 @@ export class PiBackend implements Backend {
       this.fm.tasks.setStatus(t.id, 'blocked', { reason: msg });
       this.fm.act(agentId, 'blocked', 'desk', 'blocked');
     }
+  }
+
+  /**
+   * The tests failed. Hand the task back with the real output, but only so many times: a worker
+   * that cannot fix it would otherwise be re-dispatched forever, spending tokens and never
+   * surfacing the problem. Past the cap the task is blocked, which is visible on the wall.
+   */
+  private async ciFailed(agentId: string, t: Task, ci: TestResult): Promise<void> {
+    const st = this.state;
+    const attempts = (st.ciFixes[t.id] ?? 0) + 1;
+    st.ciFixes[t.id] = attempts;
+    this.fm.store.markDirty();
+
+    const detail = ci.summary ?? `${ci.command} exited ${ci.code}`;
+    this.fm.agentLog(agentId, 'error', `CI failed: ${detail}`);
+    this.fm.bus.feed('ci', `${t.id} failed CI: ${detail}`, { agentId });
+
+    if (attempts > CI_FIX_ATTEMPTS) {
+      this.fm.tasks.setStatus(t.id, 'blocked', { force: true, reason: `CI failed ${attempts}x: ${detail}` });
+      this.fm.act(agentId, 'blocked', 'desk', `${t.id} blocked on failing tests`);
+      this.fm.log.warn(`pi: ${t.id} still failing after ${CI_FIX_ATTEMPTS} fix attempt(s); blocked`);
+      await this.schedule();
+      return;
+    }
+
+    this.fm.tasks.setStatus(t.id, 'doing', { force: true, reason: `CI failed: ${detail}` });
+    this.fm.act(agentId, 'testing', 'testbench', `fixing tests (${attempts}/${CI_FIX_ATTEMPTS})`);
+    const goal = t.goalId ? this.fm.goal(t.goalId) : this.fm.currentGoal();
+    if (!goal) return;
+    await this.runJob(
+      agentId,
+      {
+        kind: 'work',
+        agentId,
+        prompt: ciFixPrompt(t, ci.command, ci.output, ci.summary),
+        sessionKey: `task:${t.id}`,
+        taskId: t.id,
+        goalId: goal.id,
+      },
+      this.cwdFor(agentId),
+    );
   }
 
   /** A turn ended: the plan made the goal live, or a worker's task needs closing out. */
